@@ -1,0 +1,315 @@
+from __future__ import print_function
+
+import argparse
+import os
+import random
+import sys
+
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+
+
+def add_models_path():
+    candidate_roots = []
+    env_root = os.environ.get('CSGMCMC_ROOT')
+    if env_root:
+        candidate_roots.append(env_root)
+    candidate_roots.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    candidate_roots.append('/home/mplgg/csgmcmc')
+
+    for root in candidate_roots:
+        models_dir = os.path.join(root, 'models')
+        if os.path.isdir(models_dir):
+            sys.path.append(models_dir)
+            return
+    raise RuntimeError('Could not locate csgmcmc models directory.')
+
+
+add_models_path()
+from resnet import ResNet18
+
+
+DATASET_SIZE = 50000
+NUM_CYCLES = 4
+INITIAL_LR = 0.5
+WEIGHT_DECAY = 5e-4
+CHECKPOINT_PREFIX = 'cifar_csghmc'
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train and evaluate recreated CIFAR-10 cSGHMC in one run')
+    parser.add_argument('--dir', required=True, help='directory used to save checkpoints')
+    parser.add_argument('--data_path', required=True, help='directory used to store CIFAR-10')
+    parser.add_argument('--epochs', type=int, default=200, help='number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=64, help='training batch size')
+    parser.add_argument('--alpha', type=float, default=0.9, help='1.0 for SGLD, <1.0 for SGHMC')
+    parser.add_argument('--device_id', type=int, default=0, help='CUDA device id')
+    parser.add_argument('--seed', type=int, default=1, help='random seed')
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=1.0 / DATASET_SIZE,
+        help='posterior temperature'
+    )
+    parser.add_argument(
+        '--eval-num-models',
+        type=int,
+        default=None,
+        help='number of checkpoints to ensemble; default uses all saved checkpoints'
+    )
+    return parser.parse_args()
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def get_device(device_id):
+    if torch.cuda.is_available():
+        cudnn.benchmark = True
+        cudnn.deterministic = True
+        return torch.device('cuda:%d' % device_id)
+    return torch.device('cpu')
+
+
+def build_dataloaders(data_path, batch_size):
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    train_set = torchvision.datasets.CIFAR10(
+        root=data_path,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+    test_set = torchvision.datasets.CIFAR10(
+        root=data_path,
+        train=False,
+        download=True,
+        transform=test_transform,
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_set,
+        batch_size=100,
+        shuffle=False,
+        num_workers=0,
+    )
+    return train_loader, test_loader
+
+
+def cyclical_lr(epoch, batch_idx, num_batches, total_epochs):
+    total_steps = total_epochs * num_batches
+    step = epoch * num_batches + batch_idx
+    cycle_length = total_steps // NUM_CYCLES
+    cos_inner = np.pi * (step % cycle_length) / cycle_length
+    return 0.5 * (np.cos(cos_inner) + 1.0) * INITIAL_LR
+
+
+def update_params(model, lr, epoch, args, device):
+    for param in model.parameters():
+        if not hasattr(param, 'buf'):
+            param.buf = torch.zeros_like(param, device=device)
+
+        grad = param.grad.data
+        grad.add_(param.data, alpha=WEIGHT_DECAY)
+
+        buf_new = (1.0 - args.alpha) * param.buf - lr * grad
+        if (epoch % 50) + 1 > 45:
+            eps = torch.randn_like(param, device=device)
+            noise_scale = (2.0 * lr * args.alpha * args.temperature / DATASET_SIZE) ** 0.5
+            buf_new = buf_new + noise_scale * eps
+
+        param.data.add_(buf_new)
+        param.buf = buf_new
+
+
+def train_one_epoch(model, loader, criterion, device, epoch, args, num_batches):
+    model.train()
+    running_loss = 0.0
+    running_correct = 0
+    seen = 0
+
+    print('\nEpoch: %d' % epoch)
+    for batch_idx, (inputs, targets) in enumerate(loader):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        model.zero_grad()
+        lr = cyclical_lr(epoch, batch_idx, num_batches, args.epochs)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        update_params(model, lr, epoch, args, device)
+
+        running_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        seen += targets.size(0)
+        running_correct += predicted.eq(targets).sum().item()
+
+        if batch_idx % 100 == 0:
+            print(
+                'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                % (
+                    running_loss / (batch_idx + 1),
+                    100.0 * running_correct / seen,
+                    running_correct,
+                    seen,
+                )
+            )
+
+
+def evaluate_epoch(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_seen = 0
+
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(loader):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total_seen += targets.size(0)
+            total_correct += predicted.eq(targets).sum().item()
+
+            if batch_idx % 100 == 0:
+                print(
+                    'Test Loss: %.3f | Test Acc: %.3f%% (%d/%d)'
+                    % (
+                        total_loss / (batch_idx + 1),
+                        100.0 * total_correct / total_seen,
+                        total_correct,
+                        total_seen,
+                    )
+                )
+
+    print(
+        '\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+            total_loss / len(loader),
+            total_correct,
+            total_seen,
+            100.0 * total_correct / total_seen,
+        )
+    )
+
+
+def evaluate_single_checkpoint(model, loader, criterion, device):
+    model.eval()
+    losses = 0.0
+    correct = 0
+    total = 0
+    probabilities = []
+    truth = []
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            outputs = model(inputs)
+            losses += criterion(outputs, targets).item()
+            probabilities.append(F.softmax(outputs, dim=1).cpu())
+
+            _, predicted = torch.max(outputs.data, 1)
+            correct += predicted.eq(targets).sum().item()
+            total += targets.size(0)
+            truth.extend(targets.cpu().tolist())
+
+    print(
+        '\nCheckpoint eval: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+            losses / len(loader),
+            correct,
+            total,
+            100.0 * correct / total,
+        )
+    )
+    return torch.cat(probabilities, dim=0), truth
+
+
+def run_ensemble_evaluation(run_dir, loader, device, num_models):
+    model = ResNet18().to(device)
+    criterion = nn.CrossEntropyLoss()
+    all_probs = []
+    truth = None
+
+    for idx in range(num_models):
+        checkpoint = os.path.join(run_dir, '%s_%i.pt' % (CHECKPOINT_PREFIX, idx))
+        state_dict = torch.load(checkpoint, map_location=device)
+        model.load_state_dict(state_dict)
+        probs, truth = evaluate_single_checkpoint(model, loader, criterion, device)
+        all_probs.append(probs)
+
+    averaged_probs = sum(all_probs) / num_models
+    predictions = torch.argmax(averaged_probs, dim=1).tolist()
+    accuracy = sum(int(t == p) for t, p in zip(truth, predictions)) / float(len(truth))
+    test_error = (1.0 - accuracy) * 100.0
+
+    print('Ensemble accuracy: %.4f' % accuracy)
+    print('Ensemble test error: %.2f%%' % test_error)
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.dir, exist_ok=True)
+
+    set_seed(args.seed)
+    device = get_device(args.device_id)
+    train_loader, test_loader = build_dataloaders(args.data_path, args.batch_size)
+
+    model = ResNet18().to(device)
+    criterion = nn.CrossEntropyLoss()
+    num_batches = (DATASET_SIZE // args.batch_size) + 1
+    checkpoint_idx = 0
+
+    for epoch in range(args.epochs):
+        train_one_epoch(model, train_loader, criterion, device, epoch, args, num_batches)
+        evaluate_epoch(model, test_loader, criterion, device)
+
+        if (epoch % 50) + 1 > 47:
+            checkpoint_path = os.path.join(args.dir, '%s_%i.pt' % (CHECKPOINT_PREFIX, checkpoint_idx))
+            print('save!')
+            torch.save(model.state_dict(), checkpoint_path)
+            checkpoint_idx += 1
+
+    eval_num_models = args.eval_num_models if args.eval_num_models is not None else checkpoint_idx
+    if eval_num_models <= 0:
+        raise RuntimeError('No checkpoints were saved, so ensemble evaluation cannot run.')
+    if eval_num_models > checkpoint_idx:
+        raise RuntimeError(
+            'Requested %d checkpoints for evaluation, but only %d were saved.'
+            % (eval_num_models, checkpoint_idx)
+        )
+
+    print('\nRunning ensemble evaluation with %d checkpoints...\n' % eval_num_models)
+    run_ensemble_evaluation(args.dir, test_loader, device, eval_num_models)
+
+
+if __name__ == '__main__':
+    main()
