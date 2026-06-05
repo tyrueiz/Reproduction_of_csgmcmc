@@ -14,23 +14,9 @@ import torchvision
 import torchvision.transforms as transforms
 
 
-def add_models_path():
-    candidate_roots = []
-    env_root = os.environ.get('CSGMCMC_ROOT')
-    if env_root:
-        candidate_roots.append(env_root)
-    candidate_roots.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    candidate_roots.append('/home/mplgg/csgmcmc')
+models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models'))
+sys.path.append(models_dir)
 
-    for root in candidate_roots:
-        models_dir = os.path.join(root, 'models')
-        if os.path.isdir(models_dir):
-            sys.path.append(models_dir)
-            return
-    raise RuntimeError('Could not locate csgmcmc models directory.')
-
-
-add_models_path()
 from resnet import ResNet18
 
 
