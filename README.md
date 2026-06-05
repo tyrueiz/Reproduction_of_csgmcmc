@@ -20,4 +20,4 @@ python3 cifar_csghmc.py \
 
 ## Result
 
-Ensemble test error: `4.35% +- 0.06%`
+Ensemble test error: `4.29% - 4.35%`
