@@ -1,6 +1,6 @@
 # Goal
 
-Recreate part of the results https://github.com/ruqizhang/csgmcmc achieved, mainly the cSG-MCMC
+Recreate part of the results https://github.com/ruqizhang/csgmcmc achieved, only the cSGHMC results which had 4.27% +- 0.03% error rate on CIFAR 10
 
 ## Run
 
